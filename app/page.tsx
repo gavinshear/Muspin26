@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Head from "next/head";
 import Image from 'next/image';
-import type { Gain } from 'tone';
+import type { Gain, Filter, FeedbackDelay, Reverb } from 'tone';
 import type { Player, Loop, MembraneSynth, NoiseSynth, MetalSynth, FMSynth } from 'tone';
 
 // Utilities
@@ -37,13 +37,17 @@ const EVENT_VOLUME_STEP = 1; // slider step
 const PALETTE = {
   bg: "#111827", // gray-900
   panel: "#1F2937", // gray-800
-  grid: "#9CA3AF", // gray-400
+  grid: "#4B5563", // gray-600 (quieter grid so track colors read)
   playhead: "#EF4444", // red-500
   event: "#E5E7EB", // gray-200
   text: "#E5E7EB", // gray-200
   centerBtnIdle: "#3B82F6", // blue-500
   centerBtnActive: "#1D4ED8", // blue-700
 };
+
+// Per-track identity: color + name (matches the default kit)
+const TRACK_COLORS = ["#F87171", "#FBBF24", "#34D399", "#60A5FA", "#A78BFA", "#F472B6"];
+const TRACK_NAMES = ["Kick", "Snare", "Hat", "Clap", "Tom", "Perc"];
 
 // Button styles (compact)
 const btnBase = "px-2 py-1 text-xs rounded-md font-medium transition-colors text-center";
@@ -57,6 +61,10 @@ const btnFillPrimary = `${btnFillBase} ${btnFillSize} bg-blue-600 hover:bg-blue-
 const btnFillSecondary = `${btnFillBase} ${btnFillSize} bg-gray-700 hover:bg-gray-600 text-white`;
 const btnFillToggle = (active: boolean) =>
   `${btnFillBase} ${btnFillSize} ${active ? "bg-blue-600 text-white" : "bg-gray-700 text-white hover:bg-gray-600"}`;
+const btnTiny = (active: boolean, activeClasses: string) =>
+  `px-2 py-0.5 text-[10px] rounded font-bold transition-colors ${
+    active ? activeClasses : "bg-gray-800 border border-gray-700 text-gray-400 hover:text-gray-200"
+  }`;
 
 // Map per-event volume percent (0..100) to dB.
 const eventVolumeToDb = (vol: number) => {
@@ -64,6 +72,9 @@ const eventVolumeToDb = (vol: number) => {
   if (v <= 0) return -60; // effectively muted
   return -36 + 36 * (v / 100); // 1..100% => -36..0 dB
 };
+
+// Map filter cutoff percent (0..100) to Hz (exponential, 80 Hz .. 18 kHz)
+const filterToHz = (v: number) => Math.round(80 * Math.pow(18000 / 80, clamp(v, 0, 100) / 100));
 
 // ---------- Harmonic randomization helpers ----------
 // Bresenham-style even pulse distribution across steps
@@ -185,6 +196,7 @@ function SlimSlider({
   step = 1,
   value,
   onChange,
+  display,
   className = "",
 }: {
   id?: string;
@@ -194,9 +206,11 @@ function SlimSlider({
   step?: number;
   value: number;
   onChange: (v: number) => void;
+  display?: (v: number) => string;
   className?: string;
 }) {
   const sliderId = id ?? `slider-${slug(label)}`;
+  const shown = display ? display(value) : `${value}`;
   return (
     <div className={`flex flex-col items-stretch gap-1 bg-gray-900 rounded-lg p-2 border border-gray-700 w-full ${className}`}>
       <div className="flex items-center justify-between">
@@ -204,7 +218,7 @@ function SlimSlider({
           {label}
         </label>
         <span id={`${sliderId}-value`} className="text-xs text-gray-300">
-          {value}
+          {shown}
         </span>
       </div>
       <input
@@ -218,7 +232,7 @@ function SlimSlider({
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={value}
-        aria-valuetext={`${value}`}
+        aria-valuetext={shown}
         aria-orientation="horizontal"
         aria-describedby={`${sliderId}-value`}
         className="w-full h-1"
@@ -321,6 +335,20 @@ export default function RadialSequencerPage() {
   const [globalVol, setGlobalVol] = useState<number>(100);
   const [trackVolumes, setTrackVolumes] = useState<number[]>(Array.from({ length: NUM_TRACKS }, () => 100));
 
+  // Groove + mixing state
+  const [swing, setSwing] = useState<number>(0); // 0..100, shifts every 2nd step toward triplet feel
+  const swingRef = useRef<number>(0);
+  useEffect(() => {
+    swingRef.current = swing;
+  }, [swing]);
+  const [mutes, setMutes] = useState<boolean[]>(Array.from({ length: NUM_TRACKS }, () => false));
+  const [solos, setSolos] = useState<boolean[]>(Array.from({ length: NUM_TRACKS }, () => false));
+
+  // Master FX state
+  const [filterCut, setFilterCut] = useState<number>(100); // lowpass cutoff, 100 = open
+  const [reverbWet, setReverbWet] = useState<number>(12);
+  const [delayWet, setDelayWet] = useState<number>(0);
+
   // Clipboard for cycle copy/paste
   const [clipboard, setClipboard] = useState<CycleClipboard>(null);
 
@@ -373,6 +401,9 @@ export default function RadialSequencerPage() {
 
   // Audio graph refs
   const masterGainRef = useRef<Gain | null>(null); // Tone.Gain
+  const filterRef = useRef<Filter | null>(null); // Tone.Filter (master lowpass)
+  const delayRef = useRef<FeedbackDelay | null>(null); // Tone.FeedbackDelay
+  const reverbRef = useRef<Reverb | null>(null); // Tone.Reverb
   const trackGainsRef = useRef<Gain[]>([]); // Tone.Gain[]
   const playersRef = useRef<(Player | null)[]>(Array.from({ length: NUM_TRACKS }, () => null)); // Tone.Player | null
   const playerNamesRef = useRef<(string | null)[]>(Array.from({ length: NUM_TRACKS }, () => null));
@@ -426,10 +457,22 @@ export default function RadialSequencerPage() {
     playersRef.current.forEach((p) => p?.dispose?.());
     trackGainsRef.current.forEach((g) => g?.dispose?.());
     masterGainRef.current?.dispose?.();
+    filterRef.current?.dispose?.();
+    delayRef.current?.dispose?.();
+    reverbRef.current?.dispose?.();
     synthsRef.current.forEach((s) => s?.dispose?.());
 
-    const master = new Tone.Gain(globalVol / 100).toDestination();
+    // Master chain: tracks -> master gain -> lowpass filter -> delay -> reverb -> speakers
+    const master = new Tone.Gain(globalVol / 100);
+    const filter = new Tone.Filter({ type: "lowpass", frequency: filterToHz(filterCut), rolloff: -24, Q: 0.7 });
+    const delay = new Tone.FeedbackDelay({ delayTime: "8n.", feedback: 0.3, wet: delayWet / 100 });
+    const reverb = new Tone.Reverb({ decay: 2.4, wet: reverbWet / 100 });
+    master.chain(filter, delay, reverb, Tone.Destination);
     masterGainRef.current = master;
+    filterRef.current = filter;
+    delayRef.current = delay;
+    reverbRef.current = reverb;
+
     trackGainsRef.current = Array.from({ length: NUM_TRACKS }, (_, i) => new Tone.Gain(trackVolumes[i] / 100).connect(master));
 
     playersRef.current = Array.from({ length: NUM_TRACKS }, () => null);
@@ -478,6 +521,9 @@ export default function RadialSequencerPage() {
       playersRef.current.forEach((p) => p?.dispose?.());
       trackGainsRef.current.forEach((g) => g?.dispose?.());
       masterGainRef.current?.dispose?.();
+      filterRef.current?.dispose?.();
+      delayRef.current?.dispose?.();
+      reverbRef.current?.dispose?.();
       synthsRef.current.forEach((s) => s?.dispose?.());
       loadedUrlsRef.current.forEach((url) => {
         if (url) URL.revokeObjectURL(url);
@@ -486,14 +532,25 @@ export default function RadialSequencerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toneReady]);
 
-  // Sync volumes / BPM without rebuilding the graph
+  // Sync volumes / mute / solo / BPM without rebuilding the graph
   useEffect(() => {
     if (!toneRef.current || !masterGainRef.current) return;
     const Tone = toneRef.current;
     masterGainRef.current.gain.rampTo(globalVol / 100, 0.05);
-    trackGainsRef.current.forEach((g, i) => g?.gain?.rampTo?.(trackVolumes[i] / 100, 0.05));
+    const anySolo = solos.some(Boolean);
+    trackGainsRef.current.forEach((g, i) => {
+      const audible = anySolo ? solos[i] : !mutes[i];
+      g?.gain?.rampTo?.(audible ? trackVolumes[i] / 100 : 0, 0.05);
+    });
     Tone.Transport.bpm.value = bpm;
-  }, [globalVol, trackVolumes, bpm]);
+  }, [globalVol, trackVolumes, bpm, mutes, solos]);
+
+  // Sync master FX without rebuilding the graph
+  useEffect(() => {
+    filterRef.current?.frequency?.rampTo?.(filterToHz(filterCut), 0.05);
+    delayRef.current?.wet?.rampTo?.(delayWet / 100, 0.05);
+    reverbRef.current?.wet?.rampTo?.(reverbWet / 100, 0.05);
+  }, [filterCut, delayWet, reverbWet]);
 
   // Resize pattern when beats/cycles change
   useEffect(() => {
@@ -569,6 +626,10 @@ export default function RadialSequencerPage() {
       const total = Math.max(1, numBeats * numCycles);
       const step = totalStepRef.current % total;
 
+      // Swing: push every second step late, up to a triplet feel at 100%
+      const swingShift = step % 2 === 1 ? (swingRef.current / 100) * stepSeconds * (1 / 3) : 0;
+      const tTime = time + swingShift;
+
       for (let t = 0; t < NUM_TRACKS; t++) {
         const cell = patternRef.current[t]?.[step];
         const player = playersRef.current[t];
@@ -580,7 +641,7 @@ export default function RadialSequencerPage() {
               player.volume.value = db;
             } catch {}
             try {
-              player.start(time);
+              player.start(tTime);
               played = true;
             } catch {}
           }
@@ -592,22 +653,22 @@ export default function RadialSequencerPage() {
               try {
                 switch (kind) {
                   case "kick":
-                    (synth as MembraneSynth).triggerAttackRelease("C1", stepInterval, time);
+                    (synth as MembraneSynth).triggerAttackRelease("C1", stepInterval, tTime);
                     break;
                   case "snare":
-                    (synth as NoiseSynth).triggerAttackRelease(stepInterval, time);
+                    (synth as NoiseSynth).triggerAttackRelease(stepInterval, tTime);
                     break;
                   case "hat":
-                    (synth as MetalSynth).triggerAttackRelease("C6", stepInterval, time);
+                    (synth as MetalSynth).triggerAttackRelease("C6", stepInterval, tTime);
                     break;
                   case "clap":
-                    (synth as NoiseSynth).triggerAttackRelease(stepInterval, time);
+                    (synth as NoiseSynth).triggerAttackRelease(stepInterval, tTime);
                     break;
                   case "tom":
-                    (synth as MembraneSynth).triggerAttackRelease("G2", stepInterval, time);
+                    (synth as MembraneSynth).triggerAttackRelease("G2", stepInterval, tTime);
                     break;
                   default:
-                    (synth as FMSynth).triggerAttackRelease("C5", stepInterval, time, 0.8);
+                    (synth as FMSynth).triggerAttackRelease("C5", stepInterval, tTime, 0.8);
                     break;
                 }
               } catch {}
@@ -671,9 +732,22 @@ export default function RadialSequencerPage() {
     ctx.save();
     ctx.translate(cx, cy);
 
-    // Rings
+    // Solo state for dimming
+    const anySolo = solos.some(Boolean);
+    const trackAudible = (t: number) => (anySolo ? solos[t] : !mutes[t]);
+
+    // Faint colored lane fill per track
+    for (let t = 0; t < NUM_TRACKS; t++) {
+      ctx.beginPath();
+      ctx.arc(0, 0, ringRadii[t], 0, Math.PI * 2);
+      ctx.strokeStyle = `${TRACK_COLORS[t]}${trackAudible(t) ? "24" : "10"}`; // low-alpha lane tint
+      ctx.lineWidth = trackWidth * 0.72;
+      ctx.stroke();
+    }
+
+    // Ring boundaries
     ctx.strokeStyle = PALETTE.grid;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = 1;
     for (let track = 0; track <= NUM_TRACKS; track++) {
       const r = innerRadius + track * trackWidth;
       ctx.beginPath();
@@ -698,22 +772,33 @@ export default function RadialSequencerPage() {
     const playbackCycle = cycleIdx;
     const displayCycle = playbackCycle;
 
-    // Events
+    // Events (colored per track, sized by volume, glow when the playhead hits them)
     for (let t = 0; t < NUM_TRACKS; t++) {
+      const audible = trackAudible(t);
       for (let b = 0; b < numBeats; b++) {
         const stepIdx = displayCycle * numBeats + b;
         const cell = patternRef.current[t]?.[stepIdx];
         if (cell?.on) {
           const p = centers[t][b];
+          const vol = cell.vol ?? DEFAULT_EVENT_VOLUME;
+          const radius = 3.5 + 4.5 * (vol / 100);
+          const isHot = playing && audible && b === beatInCycle;
           ctx.beginPath();
-          ctx.arc(p.re - cx, p.im - cy, 6, 0, Math.PI * 2);
-          ctx.fillStyle = PALETTE.event;
+          ctx.arc(p.re - cx, p.im - cy, isHot ? radius + 2.5 : radius, 0, Math.PI * 2);
+          ctx.fillStyle = TRACK_COLORS[t];
+          ctx.globalAlpha = audible ? 1 : 0.3;
+          if (isHot) {
+            ctx.shadowColor = TRACK_COLORS[t];
+            ctx.shadowBlur = 16;
+          }
           ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.globalAlpha = 1;
         }
         if (selected && selected.track === t && selected.step === stepIdx) {
           const p = centers[t][b];
           ctx.beginPath();
-          ctx.arc(p.re - cx, p.im - cy, 9, 0, Math.PI * 2);
+          ctx.arc(p.re - cx, p.im - cy, 10, 0, Math.PI * 2);
           ctx.strokeStyle = "#3B82F6";
           ctx.lineWidth = 2;
           ctx.stroke();
@@ -744,7 +829,7 @@ export default function RadialSequencerPage() {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(playing ? "❚❚" : "▶", cx, cy);
-  }, [geometry, numBeats, playing, centers, selected, computeTransportState]);
+  }, [geometry, numBeats, playing, centers, selected, computeTransportState, ringRadii, mutes, solos]);
 
   // Redraw strategy
   const lastTsRef = useRef<number>(0);
@@ -769,7 +854,7 @@ export default function RadialSequencerPage() {
 
   useEffect(() => {
     if (!playing) draw();
-  }, [draw, pattern, selected, currentCycle, numBeats, numCycles, centers, playing]);
+  }, [draw, pattern, selected, currentCycle, numBeats, numCycles, centers, playing, mutes, solos]);
 
   // Nearest cell helper
   const findNearestCell = (mx: number, my: number) => {
@@ -824,7 +909,7 @@ export default function RadialSequencerPage() {
     setSelected({ track, step: idx });
 
     const cell = patternRef.current[track]?.[idx];
-    setLiveMsg(`Selected Track ${track + 1}, Beat ${(idx % numBeats) + 1}. ${cell?.on ? "On" : "Off"}. Volume ${cell?.vol ?? DEFAULT_EVENT_VOLUME}%`);
+    setLiveMsg(`Selected ${TRACK_NAMES[track]}, Beat ${(idx % numBeats) + 1}. ${cell?.on ? "On" : "Off"}. Volume ${cell?.vol ?? DEFAULT_EVENT_VOLUME}%`);
   };
 
   const handleContextMenu = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -850,7 +935,7 @@ export default function RadialSequencerPage() {
 
   const announceSelection = (track: number, step: number) => {
     const cell = patternRef.current[track]?.[step];
-    setLiveMsg(`Selected Track ${track + 1}, Beat ${(step % numBeats) + 1}. ${cell?.on ? "On" : "Off"}. Volume ${cell?.vol ?? DEFAULT_EVENT_VOLUME}%`);
+    setLiveMsg(`Selected ${TRACK_NAMES[track]}, Beat ${(step % numBeats) + 1}. ${cell?.on ? "On" : "Off"}. Volume ${cell?.vol ?? DEFAULT_EVENT_VOLUME}%`);
   };
 
   // Copy/Paste current cycle helpers
@@ -940,6 +1025,28 @@ export default function RadialSequencerPage() {
         e.preventDefault();
         commitSelection();
         return;
+      case "m":
+      case "M": {
+        setMutes((prev) => {
+          const next = prev.slice();
+          next[track] = !next[track];
+          setLiveMsg(`${TRACK_NAMES[track]} ${next[track] ? "muted" : "unmuted"}`);
+          return next;
+        });
+        e.preventDefault();
+        return;
+      }
+      case "s":
+      case "S": {
+        setSolos((prev) => {
+          const next = prev.slice();
+          next[track] = !next[track];
+          setLiveMsg(`${TRACK_NAMES[track]} solo ${next[track] ? "on" : "off"}`);
+          return next;
+        });
+        e.preventDefault();
+        return;
+      }
       case "[":
       case "BracketLeft": {
         if (!playing) {
@@ -1047,7 +1154,7 @@ export default function RadialSequencerPage() {
     if (!selected) {
       const displayCycle = getDisplayCycle();
       setSelected({ track: 0, step: displayCycle * numBeats });
-      setLiveMsg(`Selected Track 1, Beat 1. Off. Volume ${DEFAULT_EVENT_VOLUME}%`);
+      setLiveMsg(`Selected ${TRACK_NAMES[0]}, Beat 1. Off. Volume ${DEFAULT_EVENT_VOLUME}%`);
     }
   };
 
@@ -1056,6 +1163,41 @@ export default function RadialSequencerPage() {
     if (!toneRef.current) return;
     const Tone = toneRef.current;
     await Tone.start();
+  };
+
+  // Tap tempo
+  const tapTimesRef = useRef<number[]>([]);
+  const tapTempo = () => {
+    const now = performance.now();
+    const recent = tapTimesRef.current.filter((t) => now - t < 3000);
+    recent.push(now);
+    tapTimesRef.current = recent.slice(-6);
+    const taps = tapTimesRef.current;
+    if (taps.length >= 2) {
+      const intervals = taps.slice(1).map((t, i) => t - taps[i]);
+      const avg = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+      const next = clamp(Math.round(60000 / avg), 30, 240);
+      setBpm(next);
+      setLiveMsg(`Tempo set to ${next} BPM`);
+    } else {
+      setLiveMsg("Keep tapping to set the tempo");
+    }
+  };
+
+  // Mute/solo toggles
+  const toggleMute = (i: number) => {
+    setMutes((prev) => {
+      const next = prev.slice();
+      next[i] = !next[i];
+      return next;
+    });
+  };
+  const toggleSolo = (i: number) => {
+    setSolos((prev) => {
+      const next = prev.slice();
+      next[i] = !next[i];
+      return next;
+    });
   };
 
   // Sample loading
@@ -1238,12 +1380,20 @@ export default function RadialSequencerPage() {
     );
 
     const data = {
-      version: 2,
+      version: 3,
       bpm,
       numBeats,
       numCycles,
       halfSpeed,
+      swing,
       trackVolumes: trackVolumes.slice(0, NUM_TRACKS).map((v) => clamp(Math.round(v), 0, 100)),
+      mutes: mutes.slice(0, NUM_TRACKS).map(Boolean),
+      solos: solos.slice(0, NUM_TRACKS).map(Boolean),
+      fx: {
+        filterCut: clamp(Math.round(filterCut), 0, 100),
+        reverbWet: clamp(Math.round(reverbWet), 0, 100),
+        delayWet: clamp(Math.round(delayWet), 0, 100),
+      },
       pattern: safePattern,
       samples: playerNamesRef.current.map((n) => (typeof n === "string" ? n : null)),
     } as const;
@@ -1258,13 +1408,24 @@ export default function RadialSequencerPage() {
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(String(reader.result)) as { pattern?: unknown; [key: string]: unknown; };
+        const parsed = JSON.parse(String(reader.result)) as { pattern?: unknown; fx?: unknown; [key: string]: unknown; };
         setBpm(parsed.bpm as number ?? bpm);
         setNumBeats(parsed.numBeats as number ?? numBeats);
         setNumCycles(parsed.numCycles as number ?? numCycles);
         setCurrentCycle(0);
         setTrackVolumes(Array.isArray(parsed.trackVolumes) ? parsed.trackVolumes.slice(0, NUM_TRACKS) as number[] : trackVolumes);
         if (typeof parsed.halfSpeed === "boolean") setHalfSpeed(parsed.halfSpeed);
+
+        // v3 fields (older files simply skip these)
+        if (typeof parsed.swing === "number") setSwing(clamp(Math.round(parsed.swing), 0, 100));
+        if (Array.isArray(parsed.mutes)) setMutes(Array.from({ length: NUM_TRACKS }, (_, i) => !!(parsed.mutes as unknown[])[i]));
+        if (Array.isArray(parsed.solos)) setSolos(Array.from({ length: NUM_TRACKS }, (_, i) => !!(parsed.solos as unknown[])[i]));
+        const fx = parsed.fx as { filterCut?: unknown; reverbWet?: unknown; delayWet?: unknown } | undefined;
+        if (fx && typeof fx === "object") {
+          if (typeof fx.filterCut === "number") setFilterCut(clamp(Math.round(fx.filterCut), 0, 100));
+          if (typeof fx.reverbWet === "number") setReverbWet(clamp(Math.round(fx.reverbWet), 0, 100));
+          if (typeof fx.delayWet === "number") setDelayWet(clamp(Math.round(fx.delayWet), 0, 100));
+        }
 
         if (Array.isArray(parsed.pattern) && parsed.pattern.length === NUM_TRACKS) {
           const converted: Cell[][] = parsed.pattern.map((track: unknown) => {
@@ -1382,6 +1543,8 @@ export default function RadialSequencerPage() {
     `</svg>`
   );
 
+  const anySolo = solos.some(Boolean);
+
   return (
     <>
       <Head>
@@ -1405,7 +1568,7 @@ export default function RadialSequencerPage() {
             <div className="lg:col-span-2 bg-gray-800 rounded-xl p-3 sm:p-4">
               <div className="relative flex flex-col items-center justify-center gap-2">
                 <div id="canvas-instructions" className="sr-only">
-                  Radial step sequencer canvas. Use arrow keys to move between tracks and beats. Press Space or Enter to toggle events. Use left and right bracket keys to change cycle when paused. Use plus or minus to adjust selected event volume without turning it on. Press Escape to clear selection.
+                  Radial step sequencer canvas. Use arrow keys to move between tracks and beats. Press Space or Enter to toggle events. Press M to mute or S to solo the selected track. Use left and right bracket keys to change cycle when paused. Use plus or minus to adjust selected event volume without turning it on. Press Escape to clear selection.
                 </div>
                 <div aria-live="polite" className="sr-only">{liveMsg}</div>
 
@@ -1420,7 +1583,7 @@ export default function RadialSequencerPage() {
                   onFocus={handleCanvasFocus}
                   tabIndex={0}
                   role="application"
-                  aria-keyshortcuts="ArrowLeft,ArrowRight,ArrowUp,ArrowDown,Enter,Space,Delete,Backspace,BracketLeft,BracketRight,Plus,Minus,Escape,Control+C,Control+V"
+                  aria-keyshortcuts="ArrowLeft,ArrowRight,ArrowUp,ArrowDown,Enter,Space,Delete,Backspace,BracketLeft,BracketRight,Plus,Minus,M,S,Escape,Control+C,Control+V"
                   aria-label="Radial step sequencer canvas"
                   aria-describedby="canvas-instructions"
                   className="rounded-xl border border-gray-700 shadow-inner focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -1434,7 +1597,10 @@ export default function RadialSequencerPage() {
                     aria-label="Event volume"
                   >
                     <div className="flex items-center justify-between mb-2 gap-2">
-                      <span className="text-gray-300">Volume</span>
+                      <span className="text-gray-300">
+                        <span className="inline-block w-2 h-2 rounded-full mr-1" style={{ backgroundColor: TRACK_COLORS[selectedInfo.track] }} aria-hidden="true" />
+                        {TRACK_NAMES[selectedInfo.track]} volume
+                      </span>
                       <button className={btnSecondary} onClick={() => setSelected(null)}>
                         Close
                       </button>
@@ -1505,7 +1671,7 @@ export default function RadialSequencerPage() {
                   <div className="grid grid-cols-2 gap-2 content-start">
                     <button
                       onClick={() => setPlaying((p) => !p)}
-                      className={btnFillPrimary}
+                      className={`${btnFillPrimary} col-span-2`}
                       onMouseDown={toneStart}
                       aria-pressed={playing}
                       aria-label={playing ? "Pause" : "Play"}
@@ -1521,6 +1687,13 @@ export default function RadialSequencerPage() {
                       aria-controls={canvasId}
                     >
                       Half
+                    </button>
+                    <button
+                      onClick={tapTempo}
+                      className={btnFillSecondary}
+                      aria-label="Tap tempo"
+                    >
+                      Tap
                     </button>
                     <button onClick={randomizePattern} className={btnFillSecondary} aria-label="Randomize pattern" aria-controls={canvasId}>
                       Randomize
@@ -1543,6 +1716,7 @@ export default function RadialSequencerPage() {
                   <div className="flex flex-col gap-2">
                     <SlimSlider id="bpm" label="BPM" min={30} max={240} step={1} value={bpm} onChange={setBpm} />
                     <SlimSlider id="beats" label="Beats" min={6} max={32} step={1} value={numBeats} onChange={(v) => setNumBeats(Math.round(v))} />
+                    <SlimSlider id="swing" label="Swing" min={0} max={100} step={1} value={swing} onChange={setSwing} display={(v) => `${v}%`} />
                     <SlimSlider id="master-vol" label="Master Vol" min={0} max={100} step={1} value={globalVol} onChange={setGlobalVol} />
                   </div>
 
@@ -1560,59 +1734,90 @@ export default function RadialSequencerPage() {
                 </div>
               </div>
 
+              {/* Master FX */}
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <SlimSlider id="fx-filter" label="Filter" min={0} max={100} step={1} value={filterCut} onChange={setFilterCut} display={(v) => (v >= 100 ? "Open" : `${(filterToHz(v) / 1000).toFixed(1)}k`)} />
+                <SlimSlider id="fx-reverb" label="Reverb" min={0} max={100} step={1} value={reverbWet} onChange={setReverbWet} display={(v) => `${v}%`} />
+                <SlimSlider id="fx-delay" label="Delay" min={0} max={100} step={1} value={delayWet} onChange={setDelayWet} display={(v) => `${v}%`} />
+              </div>
+
               <div className="text-xs text-gray-400 mt-3">
                 Step interval: {stepInfo.label}; {stepInfo.stepMs} ms at {bpm} BPM. At very high tempos, perceived halving may vary—trust your ear.
               </div>
 
               {/* Tracks: compact cards */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-3">
-                {Array.from({ length: NUM_TRACKS }).map((_, i) => (
-                  <div key={i} className="rounded-lg bg-gray-900 border border-gray-700 p-2">
-                    <div className="mb-1">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium text-sm">Track {i + 1}</span>
+                {Array.from({ length: NUM_TRACKS }).map((_, i) => {
+                  const audible = anySolo ? solos[i] : !mutes[i];
+                  return (
+                    <div key={i} className={`rounded-lg bg-gray-900 border border-gray-700 p-2 ${audible ? "" : "opacity-60"}`}>
+                      <div className="mb-1">
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 font-medium text-sm">
+                            <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ backgroundColor: TRACK_COLORS[i] }} aria-hidden="true" />
+                            {TRACK_NAMES[i]}
+                          </span>
+                          <span className="flex gap-1">
+                            <button
+                              className={btnTiny(mutes[i], "bg-red-600 text-white")}
+                              onClick={() => toggleMute(i)}
+                              aria-pressed={mutes[i]}
+                              aria-label={`${mutes[i] ? "Unmute" : "Mute"} ${TRACK_NAMES[i]}`}
+                            >
+                              M
+                            </button>
+                            <button
+                              className={btnTiny(solos[i], "bg-yellow-500 text-gray-900")}
+                              onClick={() => toggleSolo(i)}
+                              aria-pressed={solos[i]}
+                              aria-label={`Solo ${TRACK_NAMES[i]} ${solos[i] ? "off" : "on"}`}
+                            >
+                              S
+                            </button>
+                          </span>
+                        </div>
+                        <div className="text-xs text-gray-400 truncate mt-1">{playerNamesRef.current[i] ?? "Default kit"}</div>
                       </div>
-                      <div className="text-xs text-gray-400 truncate mt-1">{playerNamesRef.current[i] ?? "Default kit"}</div>
-                    </div>
 
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className="text-xs w-12">Vol</span>
-                      <input
-                        type="range"
-                        min={0}
-                        max={100}
-                        value={trackVolumes[i]}
-                        onChange={(e) => changeTrackVolume(i, parseInt(e.target.value))}
-                        aria-label={`Track ${i + 1} volume`}
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={trackVolumes[i]}
-                        aria-orientation="horizontal"
-                        className="flex-1"
-                      />
-                      <span className="text-xs w-12 text-right">{trackVolumes[i]}%</span>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <label className={`${btnSecondary} cursor-pointer`}>
-                        Load
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-xs w-12">Vol</span>
                         <input
-                          type="file"
-                          accept="audio/*,.wav,.mp3,.ogg"
-                          className="hidden"
-                          onChange={(e) => handleFileChange(i, e.target.files?.[0] ?? null)}
+                          type="range"
+                          min={0}
+                          max={100}
+                          value={trackVolumes[i]}
+                          onChange={(e) => changeTrackVolume(i, parseInt(e.target.value))}
+                          aria-label={`${TRACK_NAMES[i]} volume`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={trackVolumes[i]}
+                          aria-orientation="horizontal"
+                          className="flex-1"
                         />
-                      </label>
-                      <button
-                        onClick={() => previewTrack(i)}
-                        className={btnPrimary}
-                        aria-label={`Preview Track ${i + 1}`}
-                      >
-                        Preview
-                      </button>
+                        <span className="text-xs w-12 text-right">{trackVolumes[i]}%</span>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className={`${btnSecondary} cursor-pointer`}>
+                          Load
+                          <input
+                            type="file"
+                            accept="audio/*,.wav,.mp3,.ogg"
+                            className="hidden"
+                            onChange={(e) => handleFileChange(i, e.target.files?.[0] ?? null)}
+                          />
+                        </label>
+                        <button
+                          onClick={() => previewTrack(i)}
+                          className={btnPrimary}
+                          aria-label={`Preview ${TRACK_NAMES[i]}`}
+                        >
+                          Preview
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </aside>
           </div>
@@ -1646,12 +1851,14 @@ export default function RadialSequencerPage() {
                   <li><span className="font-medium">Arrow keys:</span> Move selection between beats and tracks</li>
                   <li><span className="font-medium">Enter/Space:</span> Toggle event on/off</li>
                   <li><span className="font-medium">Delete/Backspace:</span> Clear event</li>
+                  <li><span className="font-medium">M / S:</span> Mute or solo the selected track</li>
                   <li><span className="font-medium">Plus / Minus:</span> Adjust volume without turning the event on</li>
                   <li><span className="font-medium">[ / ]:</span> Change visible cycle when paused</li>
                   <li><span className="font-medium">Ctrl/Cmd + C:</span> Copy current cycle</li>
                   <li><span className="font-medium">Ctrl/Cmd + V:</span> Paste to current cycle</li>
                   <li><span className="font-medium">Escape:</span> Clear selection or close this dialog</li>
                 </ul>
+                <p>Swing pushes every second step late, up to a triplet feel at 100%. The Filter, Reverb, and Delay sliders shape the whole mix.</p>
                 <p className="text-gray-400">If you haven&apos;t loaded samples, the default drum kit is used so Randomize is audible.</p>
               </div>
             </div>
